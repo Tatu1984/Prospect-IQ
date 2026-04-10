@@ -1,5 +1,8 @@
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
+import Google from "next-auth/providers/google";
+import Facebook from "next-auth/providers/facebook";
+import LinkedIn from "next-auth/providers/linkedin";
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/db";
@@ -9,8 +12,24 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   session: { strategy: "jwt" },
   pages: {
     signIn: "/login",
+    newUser: "/dashboard",
   },
   providers: [
+    Google({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      allowDangerousEmailAccountLinking: true,
+    }),
+    Facebook({
+      clientId: process.env.FACEBOOK_CLIENT_ID!,
+      clientSecret: process.env.FACEBOOK_CLIENT_SECRET!,
+      allowDangerousEmailAccountLinking: true,
+    }),
+    LinkedIn({
+      clientId: process.env.LINKEDIN_CLIENT_ID!,
+      clientSecret: process.env.LINKEDIN_CLIENT_SECRET!,
+      allowDangerousEmailAccountLinking: true,
+    }),
     Credentials({
       name: "credentials",
       credentials: {
@@ -48,12 +67,22 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       },
     }),
   ],
+  events: {
+    async createUser({ user }) {
+      // Give 50 free credits to new OAuth signups
+      if (user.id) {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { creditsBalance: 50 },
+        });
+      }
+    },
+  },
   callbacks: {
     async jwt({ token, user }) {
       if (user) {
         token.id = user.id;
       }
-      // Fetch fresh user data on each token refresh
       if (token.id) {
         const dbUser = await prisma.user.findUnique({
           where: { id: token.id as string },
@@ -71,6 +100,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           token.role = dbUser.role;
           token.purpose = dbUser.purpose;
           token.creditsBalance = dbUser.creditsBalance;
+          token.picture = dbUser.image;
         }
       }
       return token;
@@ -78,6 +108,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     async session({ session, token }) {
       if (session.user) {
         session.user.id = token.id as string;
+        session.user.image = token.picture as string | null;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const user = session.user as any;
         user.role = token.role;
