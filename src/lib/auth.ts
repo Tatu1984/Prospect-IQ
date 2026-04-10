@@ -1,14 +1,14 @@
 import NextAuth from "next-auth";
-import Credentials from "next-auth/providers/credentials";
 import Google from "next-auth/providers/google";
 import Facebook from "next-auth/providers/facebook";
 import LinkedIn from "next-auth/providers/linkedin";
-import { PrismaAdapter } from "@auth/prisma-adapter";
+import Credentials from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/db";
 
-export const { handlers, auth, signIn, signOut } = NextAuth({
-  adapter: PrismaAdapter(prisma),
+export const { auth, signIn, signOut } = NextAuth({
+  trustHost: true,
+  basePath: "/api/auth",
   session: { strategy: "jwt" },
   pages: {
     signIn: "/login",
@@ -20,16 +20,16 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
       allowDangerousEmailAccountLinking: true,
     }),
-    Facebook({
-      clientId: process.env.FACEBOOK_CLIENT_ID!,
+    ...(process.env.FACEBOOK_CLIENT_ID ? [Facebook({
+      clientId: process.env.FACEBOOK_CLIENT_ID,
       clientSecret: process.env.FACEBOOK_CLIENT_SECRET!,
       allowDangerousEmailAccountLinking: true,
-    }),
-    LinkedIn({
-      clientId: process.env.LINKEDIN_CLIENT_ID!,
+    })] : []),
+    ...(process.env.LINKEDIN_CLIENT_ID ? [LinkedIn({
+      clientId: process.env.LINKEDIN_CLIENT_ID,
       clientSecret: process.env.LINKEDIN_CLIENT_SECRET!,
       allowDangerousEmailAccountLinking: true,
-    }),
+    })] : []),
     Credentials({
       name: "credentials",
       credentials: {
@@ -37,64 +37,24 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        if (!credentials?.email || !credentials?.password) {
-          return null;
-        }
-
+        if (!credentials?.email || !credentials?.password) return null;
         const email = credentials.email as string;
         const password = credentials.password as string;
-
-        const user = await prisma.user.findUnique({
-          where: { email },
-        });
-
-        if (!user || !user.hashedPassword) {
-          return null;
-        }
-
-        const passwordMatch = await bcrypt.compare(password, user.hashedPassword);
-
-        if (!passwordMatch) {
-          return null;
-        }
-
-        return {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          image: user.image,
-        };
+        const user = await prisma.user.findUnique({ where: { email } });
+        if (!user || !user.hashedPassword) return null;
+        const valid = await bcrypt.compare(password, user.hashedPassword);
+        if (!valid) return null;
+        return { id: user.id, name: user.name, email: user.email, image: user.image };
       },
     }),
   ],
-  events: {
-    async createUser({ user }) {
-      // Give 50 free credits to new OAuth signups
-      if (user.id) {
-        await prisma.user.update({
-          where: { id: user.id },
-          data: { creditsBalance: 50 },
-        });
-      }
-    },
-  },
   callbacks: {
     async jwt({ token, user }) {
-      if (user) {
-        token.id = user.id;
-      }
+      if (user) token.id = user.id;
       if (token.id) {
         const dbUser = await prisma.user.findUnique({
           where: { id: token.id as string },
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            image: true,
-            role: true,
-            purpose: true,
-            creditsBalance: true,
-          },
+          select: { id: true, name: true, email: true, image: true, role: true, purpose: true, creditsBalance: true },
         });
         if (dbUser) {
           token.role = dbUser.role;
