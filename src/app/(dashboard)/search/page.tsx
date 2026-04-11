@@ -43,6 +43,28 @@ interface SearchResultPerson {
   sources: string[];
 }
 
+interface SearchDiagnostics {
+  providersEnabled: number;
+  providerRuns: {
+    id: string;
+    label: string;
+    paid: boolean;
+    resultCount: number;
+    durationMs: number;
+    costUsd: number;
+    error: string | null;
+  }[];
+  queriesRun: string[];
+  duckResultsTotal: number;
+  bingResultsTotal: number;
+  pagesScraped: number;
+  emailsDiscovered: number;
+  emailsVerified: number;
+  personalSitesTried: string[];
+  totalDurationMs: number;
+  totalApiCostUsd: number;
+}
+
 export default function SearchPage() {
   const [query, setQuery] = useState("");
   const [searchType, setSearchType] = useState("name");
@@ -52,6 +74,8 @@ export default function SearchPage() {
   const [hasSearched, setHasSearched] = useState(false);
   const [error, setError] = useState("");
   const [searchProgress, setSearchProgress] = useState<string[]>([]);
+  const [diagnostics, setDiagnostics] = useState<SearchDiagnostics | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -85,6 +109,7 @@ export default function SearchPage() {
 
       setResults(data.results || []);
       setCreditsUsed(data.creditsUsed || 0);
+      setDiagnostics(data.diagnostics || null);
     } catch {
       setError("Network error. Please try again.");
     } finally {
@@ -179,13 +204,117 @@ export default function SearchPage() {
       {/* Results */}
       {hasSearched && !isSearching && (
         <div>
-          <div className="mb-4 flex items-center justify-between">
+          <div className="mb-4 flex items-center justify-between flex-wrap gap-2">
             <p className="text-sm text-muted-foreground">
               <span className="font-medium text-foreground">{results.length}</span> result{results.length !== 1 ? "s" : ""}
               {query && <> for &quot;{query}&quot;</>}
               {creditsUsed > 0 && <span className="ml-1">&middot; {creditsUsed} credits used</span>}
+              {diagnostics && (
+                <span className="ml-1">&middot; {(diagnostics.totalDurationMs / 1000).toFixed(1)}s</span>
+              )}
             </p>
+            {diagnostics && (
+              <button
+                onClick={() => setShowDiagnostics(!showDiagnostics)}
+                className="text-xs text-primary hover:underline"
+              >
+                {showDiagnostics ? "Hide" : "Show"} search diagnostics
+              </button>
+            )}
           </div>
+
+          {/* Diagnostics panel */}
+          {diagnostics && showDiagnostics && (
+            <div className="mb-4 rounded-xl border border-border bg-card p-5 text-xs space-y-4">
+              {/* Summary */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div>
+                  <p className="text-muted-foreground">Providers run</p>
+                  <p className="font-medium text-sm">{diagnostics.providersEnabled}</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Queries executed</p>
+                  <p className="font-medium text-sm">{diagnostics.queriesRun.length}</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Pages scraped</p>
+                  <p className="font-medium text-sm">{diagnostics.pagesScraped}</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Emails verified</p>
+                  <p className="font-medium text-sm">
+                    {diagnostics.emailsVerified} / {diagnostics.emailsDiscovered}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">DuckDuckGo hits</p>
+                  <p className="font-medium text-sm">{diagnostics.duckResultsTotal}</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Bing hits</p>
+                  <p className="font-medium text-sm">{diagnostics.bingResultsTotal}</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Total time</p>
+                  <p className="font-medium text-sm">{(diagnostics.totalDurationMs / 1000).toFixed(1)}s</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">API cost</p>
+                  <p className="font-medium text-sm">
+                    ${diagnostics.totalApiCostUsd.toFixed(4)}
+                  </p>
+                </div>
+              </div>
+
+              {/* Provider runs */}
+              <div>
+                <p className="text-muted-foreground mb-2 font-medium">Data sources</p>
+                <div className="space-y-1">
+                  {diagnostics.providerRuns.map((p) => (
+                    <div key={p.id} className="flex items-center justify-between rounded bg-muted/50 px-2 py-1.5">
+                      <div className="flex items-center gap-2">
+                        <span className={cn(
+                          "inline-block h-2 w-2 rounded-full",
+                          p.error ? "bg-red-500" : p.resultCount > 0 ? "bg-emerald-500" : "bg-gray-400"
+                        )} />
+                        <span className="font-medium">{p.label}</span>
+                        {p.paid && (
+                          <span className="rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 px-1 text-[10px]">PAID</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-3 text-muted-foreground">
+                        <span>{p.resultCount} found</span>
+                        <span>{p.durationMs}ms</span>
+                        {p.costUsd > 0 && <span>${p.costUsd.toFixed(4)}</span>}
+                        {p.error && <span className="text-red-500 truncate max-w-[200px]" title={p.error}>error</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Queries */}
+              <details>
+                <summary className="text-muted-foreground cursor-pointer font-medium">
+                  Search queries ({diagnostics.queriesRun.length})
+                </summary>
+                <ul className="mt-2 space-y-0.5 font-mono">
+                  {diagnostics.queriesRun.map((q, i) => (
+                    <li key={i} className="text-muted-foreground">• {q}</li>
+                  ))}
+                </ul>
+              </details>
+
+              {diagnostics.personalSitesTried.length > 0 && (
+                <div>
+                  <p className="text-muted-foreground mb-1 font-medium">Personal sites tried</p>
+                  <p className="text-muted-foreground font-mono">
+                    {diagnostics.personalSitesTried.join(", ")}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
 
           {results.length === 0 && (
             <div className="rounded-xl border border-border bg-card p-10 text-center">

@@ -10,6 +10,9 @@ const USER_AGENT =
 export interface ScrapedPage {
   url: string;
   title: string;
+  // Full visible text (lower-cased, whitespace-collapsed) so callers can
+  // check name mentions without re-fetching
+  bodyText: string;
   emails: string[];
   phones: string[];
   socials: { platform: string; url: string; username: string }[];
@@ -60,6 +63,8 @@ function extractFromHtml(url: string, html: string): ScrapedPage {
   // Strip script/style to avoid false positive matches
   $("script, style, noscript").remove();
   const text = $("body").text();
+  // Normalize for name matching
+  const bodyText = text.toLowerCase().replace(/\s+/g, " ").slice(0, 50_000);
 
   // Emails — raw text + mailto: links
   const emails = new Set<string>();
@@ -100,6 +105,7 @@ function extractFromHtml(url: string, html: string): ScrapedPage {
   return {
     url,
     title,
+    bodyText,
     emails: Array.from(emails),
     phones: Array.from(phones),
     socials,
