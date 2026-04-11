@@ -49,44 +49,71 @@ if (process.env.GITHUB_TOKEN) {
 
 export async function searchGitHub(query: string, maxResults = 5): Promise<GitHubPerson[]> {
   try {
-    // Search users
     const searchUrl = `https://api.github.com/search/users?q=${encodeURIComponent(query)}&per_page=${maxResults}`;
-    const searchRes = await fetch(searchUrl, { headers, next: { revalidate: 3600 } });
+    const searchRes = await fetch(searchUrl, { headers, cache: "no-store" });
 
-    if (!searchRes.ok) return [];
+    const remaining = searchRes.headers.get("x-ratelimit-remaining");
+    const resetTs = searchRes.headers.get("x-ratelimit-reset");
+
+    if (!searchRes.ok) {
+      const body = await searchRes.text().catch(() => "");
+      console.error(`[github] search failed: ${searchRes.status} remaining=${remaining} reset=${resetTs} body=${body.slice(0, 200)}`);
+      return [];
+    }
 
     const searchData = await searchRes.json();
     const users: GitHubSearchResult[] = searchData.items || [];
+    console.log(`[github] search ok: ${users.length} users, rate-remaining=${remaining}`);
 
-    // Fetch full profiles in parallel
+    // Fetch full profiles in parallel. If rate-limited, fall back to the
+    // minimal info from the search result so we still return something real.
     const profiles = await Promise.all(
-      users.map(async (u): Promise<GitHubPerson | null> => {
+      users.map(async (u): Promise<GitHubPerson> => {
         try {
-          const res = await fetch(`https://api.github.com/users/${u.login}`, { headers });
-          if (!res.ok) return null;
-          const user: GitHubUser = await res.json();
-          return {
-            name: user.name || user.login,
-            username: user.login,
-            email: user.email,
-            bio: user.bio,
-            company: user.company?.replace(/^@/, "") || null,
-            location: user.location,
-            avatarUrl: user.avatar_url,
-            profileUrl: user.html_url,
-            blog: user.blog || null,
-            twitter: user.twitter_username,
-            followers: user.followers,
-            repos: user.public_repos,
-          };
-        } catch {
-          return null;
+          const res = await fetch(`https://api.github.com/users/${u.login}`, { headers, cache: "no-store" });
+          if (res.ok) {
+            const user: GitHubUser = await res.json();
+            return {
+              name: user.name || user.login,
+              username: user.login,
+              email: user.email,
+              bio: user.bio,
+              company: user.company?.replace(/^@/, "") || null,
+              location: user.location,
+              avatarUrl: user.avatar_url,
+              profileUrl: user.html_url,
+              blog: user.blog || null,
+              twitter: user.twitter_username,
+              followers: user.followers,
+              repos: user.public_repos,
+            };
+          }
+          // Rate-limited or not-found — return minimal data from search result
+          console.warn(`[github] profile ${u.login} failed: ${res.status}, falling back to search data`);
+        } catch (err) {
+          console.warn(`[github] profile ${u.login} error: ${err instanceof Error ? err.message : err}`);
         }
+        // Fallback: use only what the search endpoint returned
+        return {
+          name: u.login,
+          username: u.login,
+          email: null,
+          bio: null,
+          company: null,
+          location: null,
+          avatarUrl: u.avatar_url,
+          profileUrl: u.html_url,
+          blog: null,
+          twitter: null,
+          followers: 0,
+          repos: 0,
+        };
       })
     );
 
-    return profiles.filter((p): p is GitHubPerson => p !== null);
-  } catch {
+    return profiles;
+  } catch (err) {
+    console.error(`[github] search threw: ${err instanceof Error ? err.message : err}`);
     return [];
   }
 }
@@ -94,7 +121,7 @@ export async function searchGitHub(query: string, maxResults = 5): Promise<GitHu
 export async function getGitHubEmails(username: string): Promise<string[]> {
   // Try to get emails from public events (commits)
   try {
-    const res = await fetch(`https://api.github.com/users/${username}/events/public?per_page=10`, { headers });
+    const res = await fetch(`https://api.github.com/users/${username}/events/public?per_page=10`, { headers, cache: "no-store" });
     if (!res.ok) return [];
 
     const events = await res.json();

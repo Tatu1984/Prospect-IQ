@@ -30,8 +30,15 @@ interface SearchResultPerson {
   company: string | null;
   jobTitle: string | null;
   matchScore: number;
-  emails: { email: string; confidence: number; source: string }[];
-  phones: { phone: string; confidence: number; source: string }[];
+  emails: {
+    email: string;
+    confidence: number;
+    source: string;
+    sourceUrl: string | null;
+    verified: boolean;
+    verifyResult: string;
+  }[];
+  phones: { phone: string; confidence: number; source: string; sourceUrl: string | null }[];
   socials: { platform: string; username: string; url: string }[];
   sources: string[];
 }
@@ -54,7 +61,12 @@ export default function SearchPage() {
     setError("");
     setResults([]);
     setHasSearched(true);
-    setSearchProgress(["Searching GitHub profiles...", "Mining Google SERP...", "Generating email patterns..."]);
+    setSearchProgress([
+      "Searching GitHub profiles...",
+      "Querying DuckDuckGo...",
+      "Scraping real web pages...",
+      "Verifying emails via SMTP/MX...",
+    ]);
 
     try {
       const res = await fetch("/api/search", {
@@ -230,12 +242,19 @@ export default function SearchPage() {
                     {/* Contact data */}
                     <div className="mt-2 flex flex-wrap items-center gap-2">
                       {result.emails.slice(0, 3).map((e, i) => (
-                        <span key={i} className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs">
+                        <span
+                          key={i}
+                          title={`${e.verifyResult} · source: ${e.source}`}
+                          className={cn(
+                            "inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs",
+                            e.verified
+                              ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                              : "bg-muted"
+                          )}
+                        >
                           <Mail className="h-3 w-3" />
                           {e.email}
-                          <span className={cn("ml-1 text-[10px]", e.confidence >= 80 ? "text-emerald-500" : "text-amber-500")}>
-                            {e.confidence}%
-                          </span>
+                          {e.verified && <span className="text-[10px]">✓</span>}
                         </span>
                       ))}
                       {result.phones.slice(0, 2).map((p, i) => (

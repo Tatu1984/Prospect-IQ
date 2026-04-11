@@ -13,8 +13,6 @@ const optional = [
   "FACEBOOK_CLIENT_SECRET",
   "LINKEDIN_CLIENT_ID",
   "LINKEDIN_CLIENT_SECRET",
-  "GOOGLE_CSE_API_KEY",
-  "GOOGLE_CSE_CX",
   "GITHUB_TOKEN",
 ] as const;
 
@@ -45,6 +43,5 @@ export const env = {
   googleOAuth: !!process.env.GOOGLE_CLIENT_ID,
   facebookOAuth: !!process.env.FACEBOOK_CLIENT_ID,
   linkedinOAuth: !!process.env.LINKEDIN_CLIENT_ID,
-  googleCSE: !!process.env.GOOGLE_CSE_API_KEY,
   githubToken: !!process.env.GITHUB_TOKEN,
 };

@@ -68,7 +68,8 @@ export async function POST(request: NextRequest) {
       throw searchError;
     }
   } catch (error) {
-    console.error("[search] error:", error instanceof Error ? error.message : error);
+    const errObj = error as Error;
+    console.error("[search] error:", errObj?.message, errObj?.stack);
     return NextResponse.json(
       { error: "Search failed. Please try again." },
       { status: 500 }

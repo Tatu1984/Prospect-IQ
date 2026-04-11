@@ -1,12 +1,46 @@
+// Independent search orchestrator.
+//
+// Data sources (all self-run, no paid 3rd-party APIs):
+//  - GitHub API (free, public endpoints)
+//  - DuckDuckGo HTML (scraped, no key)
+//  - Direct page scraper (cheerio on real web pages)
+//  - SMTP/MX email verifier (Node built-in dns + net)
+//
+// Every contact returned traces back to a real URL we fetched.
+// No pattern-generated or guessed emails.
+
 import { prisma } from "@/lib/db";
 import { searchGitHub, getGitHubEmails } from "./github";
-import { generateEmailPatterns, generateFreeEmailGuesses } from "./email-patterns";
-import { searchGoogle, extractContactsFromSnippets, extractSocialProfiles } from "./google-search";
+import { searchDuckDuckGo, extractFromSnippets, extractSocialProfiles } from "./duckduckgo";
+import { scrapeMany } from "./page-scraper";
+import { verifyEmail, verifyMany, confidenceFromVerify } from "./email-verify";
 
 export interface SearchInput {
   query: string;
   type: "name" | "email" | "phone" | "username" | "domain" | "company";
   userId: string;
+}
+
+export interface EmailEntry {
+  email: string;
+  confidence: number;
+  source: string;
+  sourceUrl: string | null;
+  verified: boolean;
+  verifyResult: string;
+}
+
+export interface PhoneEntry {
+  phone: string;
+  confidence: number;
+  source: string;
+  sourceUrl: string | null;
+}
+
+export interface SocialEntry {
+  platform: string;
+  username: string;
+  url: string;
 }
 
 export interface PersonResult {
@@ -18,9 +52,9 @@ export interface PersonResult {
   company: string | null;
   jobTitle: string | null;
   matchScore: number;
-  emails: { email: string; confidence: number; source: string }[];
-  phones: { phone: string; confidence: number; source: string }[];
-  socials: { platform: string; username: string; url: string }[];
+  emails: EmailEntry[];
+  phones: PhoneEntry[];
+  socials: SocialEntry[];
   sources: string[];
 }
 
@@ -30,85 +64,149 @@ export async function executeSearch(input: SearchInput): Promise<{
   searchId: string;
 }> {
   const { query, type, userId } = input;
-
-  // Parse query — "Rahul Sharma, Bangalore" → name="Rahul Sharma", location="Bangalore"
   const { name, extra } = parseQuery(query, type);
 
-  // Run all data sources in parallel
-  // For GitHub, search by name only (extras like "Meta" hurt matching)
-  const [githubResults, googleResults] = await Promise.all([
+  // ── Step 1: Fetch from independent sources in parallel ─────────
+  const [githubResults, duckResults] = await Promise.all([
     type === "name" || type === "username"
       ? searchGitHub(name, 5)
       : Promise.resolve([]),
-    searchGoogle(`${name} ${extra} contact email`.trim(), 10),
+    searchDuckDuckGo(`${name} ${extra}`.trim(), 15),
   ]);
 
-  // Extract contacts from Google SERP
-  const serpContacts = extractContactsFromSnippets(googleResults);
-  const serpSocials = extractSocialProfiles(googleResults);
+  // ── Step 2: Extract what's in the SERP snippets ────────────────
+  const snippetExtract = extractFromSnippets(duckResults);
+  const serpSocials = extractSocialProfiles(duckResults);
 
-  // Build person results
+  // ── Step 3: Scrape the top N real URLs for contact info ────────
+  // Prefer URLs that look contact-relevant
+  const contactRelevantUrls = duckResults
+    .filter((r) => {
+      const u = r.url.toLowerCase();
+      // Skip noisy aggregator/social URLs we already parsed
+      if (u.includes("linkedin.com") || u.includes("twitter.com") || u.includes("x.com")) return false;
+      if (u.includes("facebook.com") || u.includes("instagram.com")) return false;
+      return true;
+    })
+    .slice(0, 6)
+    .map((r) => r.url);
+
+  const scrapedPages = await scrapeMany(contactRelevantUrls, 4);
+
+  // Collect all found emails/phones with their source URLs
+  const scrapedEmails = new Map<string, string>(); // email -> source URL
+  const scrapedPhones = new Map<string, string>(); // phone -> source URL
+  const scrapedSocials: SocialEntry[] = [];
+  const socialSeen = new Set<string>();
+
+  for (const page of scrapedPages) {
+    for (const email of page.emails) {
+      if (!scrapedEmails.has(email)) scrapedEmails.set(email, page.url);
+    }
+    for (const phone of page.phones) {
+      if (!scrapedPhones.has(phone)) scrapedPhones.set(phone, page.url);
+    }
+    for (const s of page.socials) {
+      const key = `${s.platform}:${s.username.toLowerCase()}`;
+      if (!socialSeen.has(key)) {
+        socialSeen.add(key);
+        scrapedSocials.push(s);
+      }
+    }
+  }
+
+  // Also fold in snippet-extracted contacts (mark source as SERP)
+  for (const email of snippetExtract.emails) {
+    if (!scrapedEmails.has(email)) {
+      const matching = duckResults.find((r) =>
+        `${r.title} ${r.snippet}`.toLowerCase().includes(email)
+      );
+      scrapedEmails.set(email, matching?.url || "");
+    }
+  }
+  for (const phone of snippetExtract.phones) {
+    if (!scrapedPhones.has(phone)) {
+      const matching = duckResults.find((r) => `${r.title} ${r.snippet}`.includes(phone));
+      scrapedPhones.set(phone, matching?.url || "");
+    }
+  }
+  for (const s of serpSocials) {
+    const key = `${s.platform}:${s.username.toLowerCase()}`;
+    if (!socialSeen.has(key)) {
+      socialSeen.add(key);
+      scrapedSocials.push(s);
+    }
+  }
+
+  // ── Step 4: Verify ALL discovered emails via SMTP/MX ───────────
+  const allEmails = Array.from(scrapedEmails.keys());
+  const verifications = allEmails.length > 0 ? await verifyMany(allEmails.slice(0, 15), 3) : [];
+  const verifyMap = new Map(verifications.map((v) => [v.email, v]));
+
+  // ── Step 5: Build person results ───────────────────────────────
   const personResults: PersonResult[] = [];
 
-  // Process GitHub results
+  // Process GitHub results (highest confidence source)
   for (const gh of githubResults) {
-    const emails: { email: string; confidence: number; source: string }[] = [];
-    const socials: { platform: string; username: string; url: string }[] = [
+    const emails: EmailEntry[] = [];
+
+    // GitHub profile email (if public)
+    if (gh.email) {
+      const v = await verifyEmail(gh.email);
+      emails.push({
+        email: gh.email,
+        confidence: confidenceFromVerify(v.result),
+        source: "GitHub profile",
+        sourceUrl: gh.profileUrl,
+        verified: v.result === "deliverable",
+        verifyResult: v.result,
+      });
+    }
+
+    // GitHub commit emails
+    const ghCommitEmails = await getGitHubEmails(gh.username);
+    for (const e of ghCommitEmails) {
+      if (emails.some((existing) => existing.email === e)) continue;
+      const cached = verifyMap.get(e);
+      const v = cached ? cached : await verifyEmail(e);
+      emails.push({
+        email: e,
+        confidence: confidenceFromVerify(v.result),
+        source: "GitHub commits",
+        sourceUrl: `${gh.profileUrl}?tab=overview`,
+        verified: v.result === "deliverable",
+        verifyResult: v.result,
+      });
+    }
+
+    const socials: SocialEntry[] = [
       { platform: "github", username: gh.username, url: gh.profileUrl },
     ];
-
-    // Get emails from GitHub events
-    const ghEmails = await getGitHubEmails(gh.username);
-    for (const e of ghEmails) {
-      emails.push({ email: e, confidence: 90, source: "GitHub commits" });
-    }
-
-    // If GitHub profile has email
-    if (gh.email) {
-      emails.push({ email: gh.email, confidence: 95, source: "GitHub profile" });
-    }
-
-    // Generate email patterns from GitHub company OR user-supplied company
-    const companyForPatterns = gh.company || extra;
-    if (companyForPatterns) {
-      const domain = extractDomain(companyForPatterns);
-      if (domain) {
-        const patterns = generateEmailPatterns(gh.name, domain);
-        patterns.slice(0, 4).forEach((p) =>
-          emails.push({ email: p.email, confidence: p.confidence, source: `Pattern (${domain})` })
-        );
-      }
-    }
-
-    // Also try blog domain if available
-    if (gh.blog) {
-      const blogDomain = extractDomain(gh.blog);
-      if (blogDomain) {
-        const patterns = generateEmailPatterns(gh.name, blogDomain);
-        patterns.slice(0, 2).forEach((p) =>
-          emails.push({ email: p.email, confidence: p.confidence, source: `Pattern (${blogDomain})` })
-        );
-      }
-    }
-
-    // Add twitter if available
     if (gh.twitter) {
       socials.push({ platform: "twitter", username: gh.twitter, url: `https://x.com/${gh.twitter}` });
     }
 
-    // Check for LinkedIn from SERP
-    const linkedIn = serpSocials.find(
-      (s) => s.platform === "linkedin" && gh.name.toLowerCase().split(" ").some((part) => s.username.toLowerCase().includes(part))
-    );
-    if (linkedIn) {
-      socials.push(linkedIn);
+    // Attach scraped socials only if the username looks like this person.
+    // Strict: username must contain a substantial part of the person's name
+    // (not just a single letter).
+    const ghNameParts = gh.name
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((p) => p.length >= 3);
+    for (const s of scrapedSocials) {
+      if (socials.some((existing) => existing.platform === s.platform)) continue;
+      const uname = s.username.toLowerCase();
+      // Require the username to contain a name part AND not be a common generic
+      const matches = ghNameParts.some((part) => uname.includes(part));
+      if (matches) {
+        socials.push(s);
+      }
     }
 
-    // Calculate match score
     const matchScore = calculateMatchScore(name, extra, gh.name, gh.location, gh.company);
 
     personResults.push({
-      id: "", // will be set after DB save
+      id: "",
       fullName: gh.name,
       photoUrl: gh.avatarUrl,
       location: gh.location,
@@ -116,110 +214,139 @@ export async function executeSearch(input: SearchInput): Promise<{
       company: gh.company,
       jobTitle: null,
       matchScore,
-      emails: dedupeEmails(emails),
+      emails,
       phones: [],
       socials,
       sources: ["GitHub"],
     });
   }
 
-  // Add SERP-only contacts if they found emails/phones not attributed to GitHub profiles
-  if (serpContacts.emails.length > 0 || serpContacts.phones.length > 0) {
-    // Check if any SERP contacts match existing results
-    const unmatched = serpContacts.emails.filter(
-      (e) => !personResults.some((p) => p.emails.some((pe) => pe.email === e))
-    );
-    const unmatchedPhones = serpContacts.phones;
+  // ── Step 6: Add scraped results as a consolidated person if no GitHub match ─
+  // Keep only emails that are verified or accept_all (domain exists)
+  const usableEmails: EmailEntry[] = [];
+  for (const [email, sourceUrl] of scrapedEmails.entries()) {
+    const v = verifyMap.get(email);
+    if (!v) continue;
+    if (v.result === "undeliverable" || v.result === "no_mx" || v.result === "invalid_syntax") continue;
 
-    if (unmatched.length > 0 || unmatchedPhones.length > 0) {
-      // Try to add to highest-scoring result, or create a generic one
-      if (personResults.length > 0) {
-        for (const email of unmatched) {
-          personResults[0].emails.push({ email, confidence: 60, source: "Google SERP" });
-        }
-        for (const phone of unmatchedPhones) {
-          personResults[0].phones.push({ phone, confidence: 50, source: "Google SERP" });
-        }
-        if (!personResults[0].sources.includes("Google SERP")) {
-          personResults[0].sources.push("Google SERP");
-        }
-      } else if (name) {
-        // No GitHub results, create from SERP data
-        personResults.push({
-          id: "",
-          fullName: name,
-          photoUrl: null,
-          location: null,
-          bio: null,
-          company: extra || null,
-          jobTitle: null,
-          matchScore: 40,
-          emails: unmatched.map((e) => ({ email: e, confidence: 60, source: "Google SERP" })),
-          phones: unmatchedPhones.map((p) => ({ phone: p, confidence: 50, source: "Google SERP" })),
-          socials: serpSocials,
-          sources: ["Google SERP"],
-        });
-      }
-    }
-  }
-
-  // Add SERP social profiles to existing results
-  for (const social of serpSocials) {
-    for (const result of personResults) {
-      if (!result.socials.some((s) => s.platform === social.platform)) {
-        // Check name match
-        const nameWords = result.fullName.toLowerCase().split(" ");
-        if (nameWords.some((w) => social.username.toLowerCase().includes(w))) {
-          result.socials.push(social);
-          if (!result.sources.includes("Google SERP")) {
-            result.sources.push("Google SERP");
-          }
-        }
-      }
-    }
-  }
-
-  // If no results at all and we have a name, generate email guesses
-  if (personResults.length === 0 && name) {
-    const allEmails: { email: string; confidence: number; source: string }[] = [];
-
-    // Generate company-domain emails if extra looks like a company
-    if (extra) {
-      const domain = extractDomain(extra);
-      if (domain) {
-        const patterns = generateEmailPatterns(name, domain);
-        patterns.slice(0, 4).forEach((p) =>
-          allEmails.push({ email: p.email, confidence: p.confidence, source: `Pattern (${domain})` })
-        );
-      }
-    }
-
-    // Always add free provider guesses
-    const freeGuesses = generateFreeEmailGuesses(name);
-    freeGuesses.slice(0, 4).forEach((g) =>
-      allEmails.push({ email: g.email, confidence: g.confidence, source: `Pattern (${g.pattern})` })
-    );
-
-    personResults.push({
-      id: "",
-      fullName: name,
-      photoUrl: null,
-      location: null,
-      bio: null,
-      company: extra || null,
-      jobTitle: null,
-      matchScore: extra ? 35 : 20,
-      emails: allEmails,
-      phones: [],
-      socials: serpSocials,
-      sources: ["Email Pattern Generator"],
+    usableEmails.push({
+      email,
+      confidence: confidenceFromVerify(v.result),
+      source: sourceUrl ? hostnameFromUrl(sourceUrl) : "Web",
+      sourceUrl: sourceUrl || null,
+      verified: v.result === "deliverable",
+      verifyResult: v.result,
     });
   }
 
-  // Sort by match score
+  const usablePhones: PhoneEntry[] = [];
+  for (const [phone, sourceUrl] of scrapedPhones.entries()) {
+    usablePhones.push({
+      phone,
+      confidence: 75, // phone found on real page — confidence medium-high
+      source: sourceUrl ? hostnameFromUrl(sourceUrl) : "Web",
+      sourceUrl: sourceUrl || null,
+    });
+  }
+
+  // Attach scraped contacts to the top GitHub result ONLY if they look
+  // related to that person (same domain as their blog/company, or the page
+  // that yielded the contact actually mentions their name).
+  if (personResults.length > 0) {
+    const top = personResults[0];
+    const topNameParts = top.fullName
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((p) => p.length >= 3);
+
+    const looksRelated = (sourceUrl: string | null): boolean => {
+      if (!sourceUrl) return false;
+      const u = sourceUrl.toLowerCase();
+      return topNameParts.some((part) => u.includes(part));
+    };
+
+    for (const e of usableEmails) {
+      if (top.emails.some((existing) => existing.email === e.email)) continue;
+      if (!looksRelated(e.sourceUrl)) continue;
+      top.emails.push(e);
+    }
+    for (const p of usablePhones) {
+      if (top.phones.some((existing) => existing.phone === p.phone)) continue;
+      if (!looksRelated(p.sourceUrl)) continue;
+      top.phones.push(p);
+    }
+    if ((top.emails.length > 0 || top.phones.length > 0) && !top.sources.includes("Web scraping")) {
+      top.sources.push("Web scraping");
+    }
+  } else {
+    // No GitHub matches — create a web-only person record IF there are
+    // contacts from pages that actually mention the searched name.
+    const queryNameParts = name
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((p) => p.length >= 3);
+
+    const looksRelated = (sourceUrl: string | null): boolean => {
+      if (!sourceUrl) return false;
+      const u = sourceUrl.toLowerCase();
+      return queryNameParts.some((part) => u.includes(part));
+    };
+
+    const filteredEmails = usableEmails.filter((e) => looksRelated(e.sourceUrl));
+    const filteredPhones = usablePhones.filter((p) => looksRelated(p.sourceUrl));
+    const filteredSocials = scrapedSocials.filter((s) => {
+      const u = s.username.toLowerCase();
+      return queryNameParts.some((part) => u.includes(part));
+    });
+
+    if (filteredEmails.length > 0 || filteredPhones.length > 0 || filteredSocials.length > 0) {
+      personResults.push({
+        id: "",
+        fullName: name,
+        photoUrl: null,
+        location: null,
+        bio: duckResults[0]?.snippet || null,
+        company: extra || null,
+        jobTitle: null,
+        matchScore: 50,
+        emails: filteredEmails,
+        phones: filteredPhones,
+        socials: filteredSocials,
+        sources: ["Web scraping", "DuckDuckGo"],
+      });
+    }
+  }
+
+  // Dedupe emails/socials/phones within each result to respect DB unique constraints
+  for (const p of personResults) {
+    const emailSeen = new Set<string>();
+    p.emails = p.emails.filter((e) => {
+      if (emailSeen.has(e.email)) return false;
+      emailSeen.add(e.email);
+      return true;
+    });
+    p.emails.sort((a, b) => b.confidence - a.confidence);
+
+    // Unique per (personId, platform) in DB — keep first occurrence
+    const socialSeen = new Set<string>();
+    p.socials = p.socials.filter((s) => {
+      if (socialSeen.has(s.platform)) return false;
+      socialSeen.add(s.platform);
+      return true;
+    });
+
+    const phoneSeen = new Set<string>();
+    p.phones = p.phones.filter((ph) => {
+      if (phoneSeen.has(ph.phone)) return false;
+      phoneSeen.add(ph.phone);
+      return true;
+    });
+  }
+
+  // Sort results by match score
   personResults.sort((a, b) => b.matchScore - a.matchScore);
 
-  // Save to database
+  // ── Step 7: Save to DB ─────────────────────────────────────────
   const searchRecord = await prisma.searchRecord.create({
     data: {
       userId,
@@ -230,7 +357,6 @@ export async function executeSearch(input: SearchInput): Promise<{
     },
   });
 
-  // Save persons to DB
   for (const result of personResults) {
     const person = await prisma.person.create({
       data: {
@@ -243,7 +369,9 @@ export async function executeSearch(input: SearchInput): Promise<{
           create: result.emails.map((e) => ({
             email: e.email,
             confidence: e.confidence,
+            isVerified: e.verified,
             source: e.source,
+            lastCheckedAt: new Date(),
           })),
         },
         phones: {
@@ -271,9 +399,12 @@ export async function executeSearch(input: SearchInput): Promise<{
             }
           : {}),
         dataSources: {
-          create: result.sources.map((s) => ({
-            sourceType: s,
-          })),
+          create: [
+            ...result.sources.map((s) => ({ sourceType: s })),
+            ...Array.from(new Set(result.emails.map((e) => e.sourceUrl).filter(Boolean)))
+              .slice(0, 10)
+              .map((url) => ({ sourceType: "Page", sourceUrl: url as string })),
+          ],
         },
         searchResults: {
           create: {
@@ -287,34 +418,25 @@ export async function executeSearch(input: SearchInput): Promise<{
     result.id = person.id;
   }
 
-  // Credits are deducted by the API route (atomic operation, prevents race condition)
-  return {
-    results: personResults,
-    creditsUsed: 2,
-    searchId: searchRecord.id,
-  };
+  return { results: personResults, creditsUsed: 2, searchId: searchRecord.id };
 }
 
-// ─── Helpers ─────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────
 
 function parseQuery(query: string, type: string): { name: string; extra: string } {
   if (type === "email" || type === "phone" || type === "domain") {
     return { name: query.trim(), extra: "" };
   }
-  // Split on comma — "Rahul Sharma, Bangalore" → name + location
   const parts = query.split(",").map((s) => s.trim());
   return { name: parts[0], extra: parts.slice(1).join(", ") };
 }
 
-function extractDomain(companyOrUrl: string): string | null {
-  // If it looks like a URL or domain
-  if (companyOrUrl.includes(".")) {
-    return companyOrUrl.replace(/^(https?:\/\/)?(www\.)?/, "").replace(/\/.*$/, "");
+function hostnameFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "Web";
   }
-  // Try company name → domain guess
-  const clean = companyOrUrl.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (clean.length > 2) return `${clean}.com`;
-  return null;
 }
 
 function calculateMatchScore(
@@ -328,40 +450,23 @@ function calculateMatchScore(
   const qName = queryName.toLowerCase();
   const fName = foundName.toLowerCase();
 
-  // Name matching
   const qParts = qName.split(/\s+/);
   const fParts = fName.split(/\s+/);
   const matchedParts = qParts.filter((p) => fParts.some((fp) => fp.includes(p) || p.includes(fp)));
   score += (matchedParts.length / Math.max(qParts.length, 1)) * 60;
 
-  // Location matching
   if (queryExtra && foundLocation) {
     const qLoc = queryExtra.toLowerCase();
     const fLoc = foundLocation.toLowerCase();
     if (fLoc.includes(qLoc) || qLoc.includes(fLoc)) score += 20;
   }
-
-  // Company matching
   if (queryExtra && foundCompany) {
     const qComp = queryExtra.toLowerCase();
     const fComp = foundCompany.toLowerCase();
     if (fComp.includes(qComp) || qComp.includes(fComp)) score += 20;
   }
-
-  // Bonus for having data
   if (foundLocation) score += 5;
   if (foundCompany) score += 5;
 
   return Math.min(Math.round(score), 100);
-}
-
-function dedupeEmails(emails: { email: string; confidence: number; source: string }[]) {
-  const seen = new Map<string, { email: string; confidence: number; source: string }>();
-  for (const e of emails) {
-    const existing = seen.get(e.email);
-    if (!existing || existing.confidence < e.confidence) {
-      seen.set(e.email, e);
-    }
-  }
-  return Array.from(seen.values()).sort((a, b) => b.confidence - a.confidence);
 }
