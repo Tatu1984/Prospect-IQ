@@ -7,7 +7,7 @@ datasource db {
   provider = "postgresql"
 }
 
-// ─── NextAuth Models ─────────────────────────────────────
+// ─── Auth Models ─────────────────────────────────────────
 
 model User {
   id             String    @id @default(cuid())
@@ -25,6 +25,7 @@ model User {
 
   accounts       Account[]
   sessions       Session[]
+  searches       SearchRecord[]
 }
 
 model Account {
@@ -33,12 +34,12 @@ model Account {
   type              String
   provider          String
   providerAccountId String
-  refresh_token     String?
-  access_token      String?
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
   expires_at        Int?
   token_type        String?
   scope             String?
-  id_token          String?
+  id_token          String? @db.Text
   session_state     String?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -68,4 +69,136 @@ enum Role {
   MANAGER
   ADMIN
   SUPER_ADMIN
+}
+
+// ─── Person & Contact Models ─────────────────────────────
+
+model Person {
+  id             String    @id @default(cuid())
+  fullName       String
+  aliases        String[]  @default([])
+  photoUrl       String?
+  location       String?
+  bio            String?   @db.Text
+  aiSummary      String?   @db.Text
+  qualityScore   Int       @default(0)
+  isOptedOut     Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  emails         PersonEmail[]
+  phones         PersonPhone[]
+  socialProfiles SocialProfile[]
+  professional   ProfessionalData?
+  education      EducationData[]
+  dataSources    DataSource[]
+  searchResults  SearchResult[]
+
+  @@index([fullName])
+}
+
+model PersonEmail {
+  id            String    @id @default(cuid())
+  personId      String
+  email         String
+  isVerified    Boolean   @default(false)
+  confidence    Int       @default(50)
+  source        String
+  lastCheckedAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@index([email])
+}
+
+model PersonPhone {
+  id         String   @id @default(cuid())
+  personId   String
+  phone      String
+  carrier    String?
+  lineType   String?
+  isWhatsApp Boolean  @default(false)
+  confidence Int      @default(50)
+  source     String
+  createdAt  DateTime @default(now())
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+}
+
+model SocialProfile {
+  id            String  @id @default(cuid())
+  personId      String
+  platform      String
+  username      String
+  profileUrl    String
+  followerCount Int?
+  isVerified    Boolean @default(false)
+  createdAt     DateTime @default(now())
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([personId, platform])
+}
+
+model ProfessionalData {
+  id        String   @id @default(cuid())
+  personId  String   @unique
+  jobTitle  String?
+  company   String?
+  industry  String?
+  seniority String?
+  startDate String?
+  createdAt DateTime @default(now())
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+}
+
+model EducationData {
+  id             String   @id @default(cuid())
+  personId       String
+  institution    String
+  degree         String?
+  fieldOfStudy   String?
+  graduationYear Int?
+  createdAt      DateTime @default(now())
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+}
+
+model DataSource {
+  id          String   @id @default(cuid())
+  personId    String
+  sourceUrl   String?
+  sourceType  String
+  extractedAt DateTime @default(now())
+  raw         String?  @db.Text
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+}
+
+// ─── Search Models ───────────────────────────────────────
+
+model SearchRecord {
+  id          String   @id @default(cuid())
+  userId      String
+  query       String
+  queryType   String   @default("name")
+  creditsUsed Int      @default(2)
+  resultCount Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  results SearchResult[]
+}
+
+model SearchResult {
+  id         String @id @default(cuid())
+  searchId   String
+  personId   String
+  matchScore Int    @default(0)
+  matchedOn  String[] @default([])
+
+  search SearchRecord @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  person Person       @relation(fields: [personId], references: [id], onDelete: Cascade)
 }
