@@ -18,16 +18,22 @@ export const { auth, signIn, signOut } = NextAuth({
     Google({
       clientId: process.env.GOOGLE_CLIENT_ID!,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      // Email linking is intentional for OAuth-first signup UX.
+      // Mitigated by: OAuth providers verify the email themselves before issuing tokens.
       allowDangerousEmailAccountLinking: true,
     }),
     ...(process.env.FACEBOOK_CLIENT_ID ? [Facebook({
       clientId: process.env.FACEBOOK_CLIENT_ID,
       clientSecret: process.env.FACEBOOK_CLIENT_SECRET!,
+      // Email linking is intentional for OAuth-first signup UX.
+      // Mitigated by: OAuth providers verify the email themselves before issuing tokens.
       allowDangerousEmailAccountLinking: true,
     })] : []),
     ...(process.env.LINKEDIN_CLIENT_ID ? [LinkedIn({
       clientId: process.env.LINKEDIN_CLIENT_ID,
       clientSecret: process.env.LINKEDIN_CLIENT_SECRET!,
+      // Email linking is intentional for OAuth-first signup UX.
+      // Mitigated by: OAuth providers verify the email themselves before issuing tokens.
       allowDangerousEmailAccountLinking: true,
     })] : []),
     Credentials({

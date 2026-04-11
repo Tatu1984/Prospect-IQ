@@ -287,12 +287,7 @@ export async function executeSearch(input: SearchInput): Promise<{
     result.id = person.id;
   }
 
-  // Deduct credits
-  await prisma.user.update({
-    where: { id: userId },
-    data: { creditsBalance: { decrement: 2 } },
-  });
-
+  // Credits are deducted by the API route (atomic operation, prevents race condition)
   return {
     results: personResults,
     creditsUsed: 2,

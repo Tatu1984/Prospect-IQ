@@ -47,3 +47,8 @@ client_secret_*.json
 
 # SoW docs
 *.docx
+
+# Playwright
+/test-results
+/playwright-report
+/playwright/.cache

@@ -1,0 +1,12 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /dashboard/
+Disallow: /admin/
+Disallow: /search
+Disallow: /profile/
+Disallow: /lists
+Disallow: /bulk
+Disallow: /api-keys
+Disallow: /billing
+Disallow: /settings
